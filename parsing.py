@@ -21,9 +21,9 @@ def extract_odds(text: str) -> int | None:
     return int(m.group(1)) if m else None
 
 def extract_stake(text: str) -> float | None:
-    m = re.search(r"(?:stake|risk|wager)\\s*\\$?([\\d,.]+)", text, re.I)
+    m = re.search(r"(?:stake|risk|wager)\s*\$?([\d,.]+)", text, re.I)
     if m:
-        return float(m.group(1).replace(",",""))
+        return float(m.group(1).replace(",", ""))
     return None
 
 def best_team_match(league: str, text: str) -> list[str]:
