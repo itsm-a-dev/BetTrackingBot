@@ -2,7 +2,7 @@
 import discord
 from discord.ext import commands, tasks
 from config import TRACK_CHANNEL_ID, CONFIDENCE_THRESHOLD, SCORES_UPDATE_INTERVAL, PROPS_UPDATE_INTERVAL
-from ocr import ocr_image
+from ocr_advanced import ocr_image_multi
 from parsing import parse_slip
 from espn import fetch_scores, find_game_id_for_teams, extract_score_and_status, find_player_stat_for_leg
 from storage import save_tracked, load_tracked
@@ -67,8 +67,8 @@ class Bets(commands.Cog):
             return
 
         try:
-            img_bytes = await message.attachments[0].read()
-            text = ocr_image(img_bytes)
+            ocr_result = ocr_image_multi(img_bytes)
+            text = ocr_result["text"]
         except Exception as e:
             print(f"[ERROR] OCR failed: {e}")
             await message.channel.send("❌ Could not read that image.")
