@@ -16,7 +16,7 @@ class Bets(commands.Cog):
 
     @commands.Cog.listener()
     @commands.Cog.listener()
-async def on_message(self, message):
+    async def on_message(self, message):
     # Ignore bot messages
     if message.author.bot:
         return
