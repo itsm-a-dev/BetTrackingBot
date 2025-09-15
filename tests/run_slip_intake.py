@@ -7,13 +7,13 @@ logging.basicConfig(level=logging.INFO)
 
 SLIPS_DIR = os.getenv("SLIPS_DIR", "tests/slips")
 MANIFEST = [
-    {"file": "QWYg6eYe9vvLMELWb17PH.png", "label": "Hard Rock – MLB/NFL parlay w/ boost"},
-    {"file": "DhiZaUzaeNyLY3g21pqR8.png", "label": "Hard Rock – NFL player SGP"},
-    {"file": "7VU3b4TcnZHdSDZdzx2jQ.png", "label": "Hard Rock – Finished tab (settled bets)"},
-    {"file": "ebzeVWcbYD2FaDoeCqZSg.png", "label": "Hard Rock – Cowboys moneyline tile"},
-    {"file": "hgQhLpUjCKB4ztbjTsZiE.png", "label": "Hard Rock – Jaguars first drive prop"},
-    {"file": "Sjk4os8B9MeV2XEUURnhg.png", "label": "Hard Rock – multi moneyline listings"},
-    {"file": "W8ADTWoy7Y4cpMDQVdTxY.png", "label": "Hard Rock – Jaguars parlay w/ props"},
+    {"file": "HRLSGPBoost2.png", "label": "Hard Rock – MLB/NFL parlay w/ boost"},
+    {"file": "HRDParlay.png", "label": "Hard Rock – NFL player SGP"},
+    {"file": "HRSingleCashes.png", "label": "Hard Rock – Finished tab (settled bets)"},
+    {"file": "HRLCrop.png", "label": "Hard Rock – Cowboys moneyline tile"},
+    {"file": "HRGCash.png", "label": "Hard Rock – Jaguars first drive prop"},
+    {"file": "HRLParlay.png", "label": "Hard Rock – multi moneyline listings"},
+    {"file": "HRLSGPBoost.png", "label": "Hard Rock – Jaguars parlay w/ props"},
 ]
 
 def summarize(text: str, n=200):
