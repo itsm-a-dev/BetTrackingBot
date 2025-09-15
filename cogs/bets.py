@@ -233,3 +233,42 @@ class Bets(commands.Cog):
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Bets(bot))
+
+@commands.command(name="listbets")
+async def list_bets(self, ctx):
+    """List all currently tracked bets."""
+    if not self.tracked:
+        await ctx.send("No active bets.")
+        return
+    lines = []
+    for mid, bet in self.tracked.items():
+        lines.append(f"**{bet['bet_type']}** {bet.get('league') or 'Mixed'} — {len(bet['legs'])} legs")
+    await ctx.send("\n".join(lines))
+
+@commands.command(name="addbet")
+async def add_bet(self, ctx, *, description: str):
+    """Manually add a bet description (no OCR)."""
+    # Minimal example: just store text
+    self.tracked[f"manual-{len(self.tracked)+1}"] = {
+        "league": None,
+        "bet_type": "manual",
+        "odds": None,
+        "stake": None,
+        "payout": None,
+        "legs": [{"type": "manual", "target_text": description}],
+        "message": None
+    }
+    save_tracked(self.tracked)
+    await ctx.send(f"Added manual bet: {description}")
+
+@commands.command(name="removebet")
+async def remove_bet(self, ctx, bet_id: str):
+    """Remove a bet by ID."""
+    if bet_id in self.tracked:
+        self.tracked.pop(bet_id)
+        save_tracked(self.tracked)
+        await ctx.send(f"Removed bet {bet_id}")
+    else:
+        await ctx.send(f"No bet found with ID {bet_id}")
+
+
