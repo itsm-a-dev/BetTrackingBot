@@ -1,183 +1,146 @@
-# ocr_advanced.py
-import os
-import re
-import io
-import cv2
-import math
-import numpy as np
-from typing import Dict, List, Tuple, Optional
-from PIL import Image
-import pytesseract
-import unicodedata
 import logging
+from typing import Dict, Any, List, Tuple, Optional
 
-DEBUG = os.getenv("OCR_DEBUG", "0") == "1"
-LOG = logging.getLogger("ocr")
+import numpy as np
+import cv2
 
-# Safe, explicit tesseract configs (note: raw strings for backslashes)
-TESS_CONFIGS = [
-    # Body text, single uniform block
-    r"--oem 3 --psm 6 -c preserve_interword_spaces=1 -c tessedit_char_blacklist=|{}[]<>\\",
-    # Sparse/columns, sometimes works better on app screenshots
-    r"--oem 3 --psm 4 -c preserve_interword_spaces=1 -c tessedit_char_blacklist=|{}[]<>\\",
-]
+from config import Config
+from ocr import preprocess_for_ocr, run_tesseract, extract_text_blocks
 
-# Tokens we expect in sportsbook slips (used in simple scoring heuristic)
-EXPECTED_TOKENS = [
-    "PARLAY", "WAGER", "TO WIN", "PAYOUT", "ODDS", "BOOST", "SGP", "SGPMAX",
-    "TO RECORD", "ANYTIME TD", "TO WIN", "OVER", "UNDER", "TODAY", "EDT",
-    "BET", "HARD ROCK", "HARD ROCK BET", "ID:", "PAID", "FINAL", "WON", "LOSS"
-]
+logger = logging.getLogger("ocr_advanced")
 
-def _to_pil(arr: np.ndarray) -> Image.Image:
-    if arr.ndim == 2:
-        return Image.fromarray(arr)
-    return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
 
-def _deskew(gray: np.ndarray) -> np.ndarray:
-    coords = np.column_stack(np.where(gray < 255))
-    if coords.size == 0:
-        return gray
-    angle = cv2.minAreaRect(coords)[-1]
-    angle = -(90 + angle) if angle < -45 else -angle
-    (h, w) = gray.shape[:2]
-    M = cv2.getRotationMatrix2D((w // 2, h // 2), angle, 1.0)
-    return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+try:
+    import easyocr
+except Exception:
+    easyocr = None
 
-def _preprocess_variant(img_bytes: bytes, mode: str, rotate: Optional[int] = None) -> Image.Image:
-    arr = np.frombuffer(img_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Failed to decode image")
 
-    if rotate:
-        # rotate in 90-degree increments as needed
-        rot_k = {90: 1, 180: 2, 270: 3}.get(rotate, 0)
-        if rot_k:
-            img = cv2.rotate(img, [cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE][rot_k-1])
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    if mode == "primary":
-        gray = cv2.bilateralFilter(gray, 9, 75, 75)
-        gray = cv2.convertScaleAbs(gray, alpha=1.3, beta=8)
-        try:
-            gray = _deskew(gray)
-        except Exception:
-            pass
-        thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                    cv2.THRESH_BINARY, 31, 2)
-        kernel = np.ones((1, 1), np.uint8)
-        thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel)
-        return _to_pil(thr)
-
-    elif mode == "light":
-        # light-touch for clean screenshots
-        gray = cv2.convertScaleAbs(gray, alpha=1.2, beta=4)
-        return _to_pil(gray)
-
-    elif mode == "contrast":
-        # sharpen + otsu for bold fonts
-        blur = cv2.GaussianBlur(gray, (3, 3), 0)
-        sharp = cv2.addWeighted(gray, 1.5, blur, -0.5, 0)
-        _, thr = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        return _to_pil(thr)
-
-    else:
-        return _to_pil(gray)
-
-def _sanitize(text: str) -> str:
-    # Normalize unicode to NFKC; drop control chars but keep newlines and spaces
-    text = unicodedata.normalize("NFKC", text)
-    # Escape backslashes to avoid downstream escape/regex issues
-    text = text.replace("\\", "\\\\")
-    # Remove non-printable except newline and common whitespace
-    text = re.sub(r"[^\x09\x0A\x0D\x20-\x7E]", "", text)
-    # Normalize line endings and trim trailing newlines/spaces per line
-    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n")]
-    while lines and lines[-1] == "":
-        lines.pop()
-    return "\n".join(lines)
-
-def _score_text(text: str) -> float:
-    if not text:
-        return 0.0
-    L = len(text)
-    # Ratio features
-    alpha = sum(c.isalpha() for c in text) / L
-    digit = sum(c.isdigit() for c in text) / L
-    pluses = text.count("+")
-    dashes = text.count("-")
-    tokens = sum(1 for t in EXPECTED_TOKENS if t in text.upper())
-    # Heuristic: want enough letters and digits, presence of tokens, some odds symbols, and multiple lines
-    lines = text.count("\n") + 1
-    score = (alpha * 0.35 + digit * 0.25) * 100
-    score += min(pluses + dashes, 10) * 1.5
-    score += min(tokens, 10) * 3.0
-    score += min(lines, 40) * 0.5
-    # Lightly penalize if too short
-    if L < 60:
-        score *= 0.6
-    return score
-
-def _ocr_once(pil_img: Image.Image, config: str) -> str:
+def _init_yolo(model_path: str):
+    if YOLO is None:
+        return None
     try:
-        txt = pytesseract.image_to_string(pil_img, config=config)
+        return YOLO(model_path)
     except Exception as e:
-        if DEBUG:
-            LOG.exception(f"[OCR] Tesseract error: {e}")
+        logger.warning(f"YOLO init failed: {e}")
+        return None
+
+
+def detect_regions(config: Config, image_bgr: np.ndarray) -> List[Tuple[int, int, int, int, float, str]]:
+    model = _init_yolo(config.yolo_model_path) if config.use_yolo_detection else None
+    if model is None:
+        return []
+    try:
+        results = model.predict(source=image_bgr, verbose=False)[0]
+        out = []
+        for b in results.boxes:
+            x1, y1, x2, y2 = map(int, b.xyxy[0].tolist())
+            conf = float(b.conf[0])
+            cls = int(b.cls[0]) if b.cls is not None else -1
+            label = results.names.get(cls, str(cls))
+            if conf >= config.region_min_confidence:
+                out.append((x1, y1, x2, y2, conf, label))
+        return out
+    except Exception as e:
+        logger.debug(f"Region detection failed: {e}")
+        return []
+
+
+def _easyocr_reader():
+    if easyocr is None:
+        return None
+    try:
+        return easyocr.Reader(["en"], gpu=False)
+    except Exception as e:
+        logger.warning(f"EasyOCR init failed: {e}")
+        return None
+
+
+def run_easyocr_text(reader, image_bgr: np.ndarray, min_conf_pct: float) -> str:
+    if reader is None:
         return ""
-    return _sanitize(txt)
+    try:
+        results = reader.readtext(image_bgr)
+        lines = {}
+        for (bbox, txt, conf) in results:
+            if conf < min_conf_pct * 100.0:
+                continue
+            ys = [p[1] for p in bbox]
+            row = int(np.mean(ys) // 20)
+            lines.setdefault(row, "")
+            lines[row] += ((" " if lines[row] else "") + txt.strip())
+        return "\n".join([lines[k] for k in sorted(lines.keys()) if lines[k]])
+    except Exception as e:
+        logger.debug(f"EasyOCR failed: {e}")
+        return ""
 
-def ocr_image_multi(img_bytes: bytes) -> Dict[str, str]:
+
+def _tesseract_text(image_bgr: np.ndarray, min_conf: float) -> str:
+    pre = preprocess_for_ocr(cv2.imencode(".png", image_bgr)[1].tobytes())
+    res = run_tesseract(pre)
+    return extract_text_blocks(res, min_conf)
+
+
+def _multipass_variants(image_bgr: np.ndarray) -> List[np.ndarray]:
+    # Try different contrast/threshold variants to recover faint text.
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    variants = []
+    for alpha in (1.0, 1.3, 1.6):  # contrast
+        adj = cv2.convertScaleAbs(gray, alpha=alpha, beta=0)
+        thr = cv2.adaptiveThreshold(adj, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 31, 5)
+        variants.append(cv2.cvtColor(thr, cv2.COLOR_GRAY2BGR))
+    return variants
+
+
+def run_ocr(image_bytes: bytes, config: Config) -> Dict[str, Any]:
     """
-    Returns dict: {
-      'text': best_text,
-      'mode': chosen_mode,
-      'config': chosen_config,
-      'candidates': [ (mode, rotate, cfg_idx, score, length) ... ],
-      'raw': { key: text }
-    }
+    Advanced OCR entrypoint:
+    - Optional YOLO region detection → crop and OCR per region.
+    - EasyOCR fallback if enabled and Tesseract confidence is expected to be low.
+    - Multipass preprocessing variants if text is too sparse.
+    Returns: {"text": str, "regions": list}
     """
-    variants = [
-        ("primary", None),
-        ("light", None),
-        ("contrast", None),
-        ("primary", 90),
-        ("primary", 180),
-        ("primary", 270),
-    ]
+    np_data = np.frombuffer(image_bytes, np.uint8)
+    image_bgr = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
+    if image_bgr is None:
+        raise ValueError("Failed to decode image bytes.")
 
-    candidates: List[Tuple[str, Optional[int], int, float, int]] = []
-    raw_map: Dict[str, str] = {}
+    regions = detect_regions(config, image_bgr)
+    reader = _easyocr_reader() if config.use_easyocr else None
 
-    for mode, rot in variants:
-        pil_img = _preprocess_variant(img_bytes, mode, rotate=rot)
-        for cfg_idx, cfg in enumerate(TESS_CONFIGS):
-            text = _ocr_once(pil_img, cfg)
-            key = f"{mode}|rot={rot or 0}|cfg={cfg_idx}"
-            raw_map[key] = text
-            score = _score_text(text)
-            candidates.append((mode, rot, cfg_idx, score, len(text)))
-            if DEBUG:
-                LOG.info(f"[OCR] {key} -> score={score:.1f}, len={len(text)}")
+    aggregated_text: List[str] = []
+    debug_regions: List[Dict[str, Any]] = []
 
-    # pick best by score, tie-breaker by length
-    best = max(candidates, key=lambda x: (x[3], x[4])) if candidates else None
-    if not best:
-        return {"text": "", "mode": "", "config": "", "candidates": [], "raw": {}}
+    def ocr_any(bgr: np.ndarray) -> str:
+        # Try Tesseract first
+        text = _tesseract_text(bgr, config.ocr_confidence_threshold)
+        if not text.strip() and config.use_easyocr and reader is not None:
+            text = run_easyocr_text(reader, bgr, config.ocr_confidence_threshold)
+        if not text.strip() and config.multipass_enabled:
+            for v in _multipass_variants(bgr):
+                text = _tesseract_text(v, config.low_confidence_retry_threshold)
+                if text.strip():
+                    break
+        return text
 
-    best_key = f"{best[0]}|rot={best[1] or 0}|cfg={best[2]}"
-    result = {
-        "text": raw_map.get(best_key, ""),
-        "mode": best[0],
-        "config": f"cfg_idx={best[2]}",
-        "candidates": [(m, r or 0, c, s, L) for (m, r, c, s, L) in candidates],
-        "raw": raw_map,
-    }
+    if regions:
+        for (x1, y1, x2, y2, conf, label) in regions:
+            crop = image_bgr[y1:y2, x1:x2]
+            text = ocr_any(crop)
+            if text.strip():
+                aggregated_text.append(text)
+                debug_regions.append({"bbox": (x1, y1, x2, y2), "conf": conf, "label": label, "text": text})
+    else:
+        text = ocr_any(image_bgr)
+        if text.strip():
+            aggregated_text.append(text)
 
-    if DEBUG:
-        preview = result["text"][:600].replace("\n", "\\n")
-        LOG.info(f"[OCR] Best={best_key}, score={best[3]:.1f}, len={best[4]}, preview={preview}")
+    combined = "\n\n".join(aggregated_text).strip()
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("Advanced OCR combined text:\n" + combined)
 
-    return result
+    return {"text": combined, "regions": debug_regions}
