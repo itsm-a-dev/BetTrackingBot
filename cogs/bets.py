@@ -1,270 +1,195 @@
-# cogs/bets.py
+import logging
+from typing import Dict, Any
+from datetime import datetime
+
 import discord
 from discord.ext import commands, tasks
-from config import TRACK_CHANNEL_ID, CONFIDENCE_THRESHOLD, SCORES_UPDATE_INTERVAL, PROPS_UPDATE_INTERVAL
-from ocr_advanced import ocr_image_multi
-from parsing import parse_slip
-from espn import fetch_scores, find_game_id_for_teams, extract_score_and_status, find_player_stat_for_leg
-from storage import save_tracked, load_tracked
 
-class Bets(commands.Cog):
+from config import Config
+from ocr_advanced import run_ocr
+from format_router import route_text
+from parsing import parse_slip_text
+from storage import save_tracked_bets, load_tracked_bets
+from espn import fetch_scoreboard, fuzzy_match_game, extract_live_score, extract_player_prop_status
+from db import insert_bet, mark_settlement
+
+logger = logging.getLogger("cog.bets")
+
+
+class BetsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.tracked = load_tracked()
-        print(f"[INIT] Loaded {len(self.tracked)} tracked bets from storage")
-        self.update_scores.start()
-        self.update_props.start()
+        self.config: Config = bot.config
+        self.tracked: Dict[str, Any] = load_tracked_bets()
+        self.scores_update_loop.start()
+        self.props_update_loop.start()
+        self.settlement_loop.start()
 
     def cog_unload(self):
-        self.update_scores.cancel()
-        self.update_props.cancel()
-        save_tracked(self.tracked)
+        self.scores_update_loop.cancel()
+        self.props_update_loop.cancel()
+        self.settlement_loop.cancel()
 
-    # --- UI Commands ---
-    @commands.command(name="listbets")
-    async def list_bets(self, ctx):
-        """List all currently tracked bets."""
-        if not self.tracked:
-            await ctx.send("No active bets.")
-            return
-        lines = []
-        for bid, bet in self.tracked.items():
-            lines.append(f"**{bid}** — {bet['bet_type']} ({bet.get('league') or 'Mixed'}) — {len(bet['legs'])} legs")
-        await ctx.send("\n".join(lines))
-
-    @commands.command(name="addbet")
-    async def add_bet(self, ctx, *, description: str):
-        """Manually add a bet description (no OCR)."""
-        bet_id = f"manual-{len(self.tracked)+1}"
-        self.tracked[bet_id] = {
-            "league": None,
-            "bet_type": "manual",
-            "odds": None,
-            "stake": None,
-            "payout": None,
-            "legs": [{"type": "manual", "target_text": description}],
-            "message": None
-        }
-        save_tracked(self.tracked)
-        await ctx.send(f"Added manual bet `{bet_id}`: {description}")
-
-    @commands.command(name="removebet")
-    async def remove_bet(self, ctx, bet_id: str):
-        """Remove a bet by ID."""
-        if bet_id in self.tracked:
-            self.tracked.pop(bet_id)
-            save_tracked(self.tracked)
-            await ctx.send(f"Removed bet `{bet_id}`")
-        else:
-            await ctx.send(f"No bet found with ID `{bet_id}`")
-
-    # --- OCR Intake ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
         if message.author.bot:
             return
-        if message.channel.id != TRACK_CHANNEL_ID or not message.attachments:
+        if self.config.channel_id and message.channel.id != self.config.channel_id:
+            return
+        if not message.attachments:
             return
 
+        for att in message.attachments:
+            if att.content_type and ("image" in att.content_type):
+                await self._process_slip_image(message, att)
+
+    async def _process_slip_image(self, message: discord.Message, attachment: discord.Attachment):
         try:
-            ocr_result = ocr_image_multi(img_bytes)
-            text = ocr_result["text"]
+            img_bytes = await attachment.read()
+            ocr_out = run_ocr(img_bytes, self.config)
+            routed_text, style = route_text(ocr_out["text"], self.config)
+            parsed = parse_slip_text(routed_text, self.config.ocr_confidence_threshold, style)
+
+            bet_id = f"bet_{message.id}_{attachment.id}"
+            bet_obj = {
+                "user": str(message.author),
+                "created_at": datetime.utcnow().isoformat(),
+                "stake": parsed.stake,
+                "payout": parsed.payout,
+                "legs": [
+                    {
+                        "league": leg.league,
+                        "type": leg.leg_type,
+                        "teams_or_player": leg.teams_or_player,
+                        "market": leg.market,
+                        "odds": leg.odds,
+                        "status": "pending",
+                        "match": None,
+                        "live": None,
+                    } for leg in parsed.legs
+                ],
+                "raw_text": parsed.raw_text,
+                "style": parsed.sportsbook_style,
+                "regions": ocr_out.get("regions", []),
+            }
+            self.tracked[bet_id] = bet_obj
+            save_tracked_bets(self.tracked)
+            await insert_bet(bet_id, bet_obj)
+
+            embed = discord.Embed(title="Bet tracked", color=0x00B2FF)
+            embed.add_field(name="Stake", value=str(parsed.stake or "Unknown"), inline=True)
+            embed.add_field(name="Payout", value=str(parsed.payout or "Unknown"), inline=True)
+            for i, leg in enumerate(parsed.legs, start=1):
+                embed.add_field(
+                    name=f"Leg {i}",
+                    value=f"{leg.league} | {leg.market}\n{leg.teams_or_player}\nOdds: {leg.odds or 'N/A'}",
+                    inline=False
+                )
+            await message.reply(embed=embed)
         except Exception as e:
-            print(f"[ERROR] OCR failed: {e}")
-            await message.channel.send("❌ Could not read that image.")
+            logger.exception(f"OCR/parse failed: {e}")
+            await message.reply("Failed to parse slip image. Please try a clearer screenshot or manual add via !addbet.")
+
+    @commands.command(name="listbets")
+    async def listbets(self, ctx: commands.Context):
+        if not self.tracked:
+            await ctx.reply("No active bets tracked.")
             return
+        embed = discord.Embed(title="Tracked Bets", color=0x00B2FF)
+        for bet_id, bet in list(self.tracked.items())[:10]:
+            legs_desc = "\n".join([
+                f"- {l['league']} | {l['market']} | {l['teams_or_player']} ({l.get('status','pending')})"
+                for l in bet["legs"]
+            ])
+            embed.add_field(name=bet_id, value=legs_desc or "No legs", inline=False)
+        await ctx.reply(embed=embed)
 
-        parsed = parse_slip(text)
-        confidence = 0.9 if parsed.legs and any(l.type != "unknown" for l in parsed.legs) else 0.5
-        if confidence < CONFIDENCE_THRESHOLD:
-            await message.channel.send(f"{message.author.mention} ⚠️ Low confidence parse — please edit manually.")
-            return
+    @commands.command(name="addbet")
+    async def addbet(self, ctx: commands.Context, *, json_payload: str):
+        import json
+        try:
+            payload = json.loads(json_payload)
+            bet_id = f"bet_{ctx.message.id}"
+            self.tracked[bet_id] = payload
+            save_tracked_bets(self.tracked)
+            await insert_bet(bet_id, payload)
+            await ctx.reply(f"Added bet {bet_id}.")
+        except Exception as e:
+            logger.exception(f"Manual add failed: {e}")
+            await ctx.reply("Invalid JSON payload.")
 
-        embed = discord.Embed(
-            title="🎯 Parlay" if parsed.bet_type == "parlay" else "📄 Bet Recorded",
-            color=discord.Color.blurple()
-        )
-        embed.add_field(name="League", value=parsed.league or "Mixed", inline=True)
-        if parsed.odds is not None:
-            embed.add_field(name="Odds", value=str(parsed.odds), inline=True)
-        if parsed.stake is not None:
-            embed.add_field(name="Stake", value=f"${parsed.stake}", inline=True)
-        if parsed.payout is not None:
-            embed.add_field(name="Payout", value=f"${parsed.payout}", inline=True)
+    @commands.command(name="removebet")
+    async def removebet(self, ctx: commands.Context, bet_id: str):
+        if bet_id in self.tracked:
+            del self.tracked[bet_id]
+            save_tracked_bets(self.tracked)
+            await ctx.reply(f"Removed {bet_id}.")
+        else:
+            await ctx.reply("Bet ID not found.")
 
-        lines = []
-        for idx, leg in enumerate(parsed.legs, start=1):
-            if leg.type == "prop":
-                detail = []
-                if leg.side: detail.append(leg.side.upper())
-                if leg.line is not None: detail.append(str(leg.line))
-                tgt = " ".join(detail) if detail else (leg.target_text or "")
-                lines.append(f"{idx}. {leg.player} — {leg.stat.title()} {tgt}".strip())
-            elif leg.type == "total":
-                lines.append(f"{idx}. Total — {leg.side.upper() if leg.side else ''} {leg.line or ''}".strip())
-            elif leg.type == "spread":
-                lines.append(f"{idx}. Spread — {leg.team} {leg.line}")
-            elif leg.type == "moneyline":
-                lines.append(f"{idx}. Moneyline — {leg.team or 'Unknown'}")
-            else:
-                lines.append(f"{idx}. {leg.target_text or 'Unknown leg'}")
-        embed.add_field(name="Legs", value="\n".join(lines) if lines else "—", inline=False)
-        embed.set_footer(text="Odds locked at capture")
-
-        posted = await message.channel.send(embed=embed)
-        bet_id = str(posted.id)
-        self.tracked[bet_id] = {
-            "league": parsed.league,
-            "bet_type": parsed.bet_type,
-            "odds": parsed.odds,
-            "stake": parsed.stake,
-            "payout": parsed.payout,
-            "legs": [leg.__dict__ for leg in parsed.legs],
-            "message": posted
-        }
-        save_tracked(self.tracked)
-        posted = await message.channel.send(embed=embed)
-        bet_id = str(posted.id)
-        self.tracked[bet_id] = {
-            "league": parsed.league,
-            "bet_type": parsed.bet_type,
-            "odds": parsed.odds,
-            "stake": parsed.stake,
-            "payout": parsed.payout,
-            "legs": [leg.__dict__ for leg in parsed.legs],
-            "message": posted
-        }
-        save_tracked(self.tracked)
-
-    # --- Update Loops ---
-    @tasks.loop(seconds=SCORES_UPDATE_INTERVAL)
-    async def update_scores(self):
-        for msg_id, bet in list(self.tracked.items()):
-            try:
-                if all(l["type"] == "prop" for l in bet["legs"]):
-                    continue
-                league = bet["league"]
-                scoreboard = await fetch_scores(league)
-                events = scoreboard.get("events", [])
+    @tasks.loop(seconds=60.0)
+    async def scores_update_loop(self):
+        try:
+            for bet_id, bet in self.tracked.items():
                 for leg in bet["legs"]:
-                    if not leg.get("game_id") and leg.get("game_teams"):
-                        gid = find_game_id_for_teams(leg["league"] or league, leg["game_teams"], scoreboard)
-                        if gid:
-                            leg["game_id"] = gid
-                msg: discord.Message = bet["message"]
-                new = discord.Embed(title=msg.embeds[0].title, color=msg.embeds[0].color)
-                new.add_field(name="League", value=bet["league"] or "Mixed", inline=True)
-                if bet.get("odds") is not None:
-                    new.add_field(name="Odds", value=str(bet["odds"]), inline=True)
-                if bet.get("stake") is not None:
-                    new.add_field(name="Stake", value=f"${bet['stake']}", inline=True)
-                if bet.get("payout") is not None:
-                    new.add_field(name="Payout", value=f"${bet['payout']}", inline=True)
-                lines = []
-                for idx, leg in enumerate(bet["legs"], start=1):
-                    if leg["type"] == "prop":
-                        detail = []
-                        if leg.get("side"): detail.append(leg["side"].upper())
-                        if leg.get("line") is not None: detail.append(str(leg["line"]))
-                        tgt = " ".join(detail) if detail else (leg.get("target_text") or "")
-                        lines.append(f"{idx}. {leg.get('player')} — {str(leg.get('stat')).title()} {tgt}".strip())
-                    elif leg["type"] == "total":
-                        lines.append(f"{idx}. Total — {leg.get('side','').upper()} {leg.get('line')}")
-                    elif leg["type"] == "spread":
-                        lines.append(f"{idx}. Spread — {leg.get('team')} {leg.get('line')}")
-                    elif leg["type"] == "moneyline":
-                        lines.append(f"{idx}. Moneyline — {leg.get('team') or 'Unknown'}")
-                    else:
-                        lines.append(f"{idx}. {leg.get('target_text') or 'Unknown leg'}")
-                new.add_field(name="Legs", value="\n".join(lines) if lines else "—", inline=False)
-                first_event = None
+                    league = leg["league"]
+                    if league in ("Unknown", "UFC"):
+                        continue
+                    try:
+                        data = await fetch_scoreboard(self.config, league)
+                        match = fuzzy_match_game(league, leg["teams_or_player"], data.get("events", []))
+                        if match:
+                            _, event = match
+                            leg["match"] = {"id": event.get("id")}
+                            leg["live"] = extract_live_score(event)
+                    except Exception as e:
+                        logger.debug(f"Scores update failed for {league}: {e}")
+            save_tracked_bets(self.tracked)
+        except Exception as e:
+            logger.exception(f"Scores loop error: {e}")
+
+    @tasks.loop(seconds=20.0)
+    async def props_update_loop(self):
+        try:
+            for bet_id, bet in self.tracked.items():
                 for leg in bet["legs"]:
-                    if leg.get("game_id"):
-                        first_event = next((e for e in events if e["id"] == leg["game_id"]), None)
-                        if first_event:
-                            break
-                if first_event:
-                    ss = extract_score_and_status(first_event)
-                    new.add_field(name="Score", value=ss["score"], inline=False)
-                    new.add_field(name="Status", value=ss["status"], inline=False)
-                new.set_footer(text="Odds locked at capture")
-                await msg.edit(embed=new)
-                save_tracked(self.tracked)
-            except Exception as e:
-                print(f"[ERROR] update_scores failed for msg_id={msg_id}: {e}")
+                    if leg["type"] != "prop":
+                        continue
+                    league = leg["league"]
+                    player = leg["teams_or_player"] if leg["teams_or_player"] != "Unknown" else ""
+                    metric = leg["market"]
+                    if leg.get("match") and player:
+                        leg["prop_status"] = extract_player_prop_status(league, {}, player, metric)
+            save_tracked_bets(self.tracked)
+        except Exception as e:
+            logger.exception(f"Props loop error: {e}")
 
-    @tasks.loop(seconds=PROPS_UPDATE_INTERVAL)
-    async def update_props(self):
-        for msg_id, bet in list(self.tracked.items()):
-            try:
-                prop_legs = [l for l in bet["legs"] if l["type"] == "prop"]
-                if not prop_legs:
-                    continue
-                for leg in prop_legs:
-                    league = leg.get("league") or bet["league"]
-                    if not league or not leg.get("game_teams"):
-                        continue
-                    scoreboard = await fetch_scores(league)
-                    gid = leg.get("game_id") or find_game_id_for_teams(league, leg["game_teams"], scoreboard)
-                    if not gid:
-                        continue
-                    leg["game_id"] = gid
-                    event = next((e for e in scoreboard.get("events", []) if e["id"] == gid), None)
-                    if not event:
-                        continue
-                    current = find_player_stat_for_leg(league, event, leg.get("player") or "", leg.get("stat") or "")
-                    if current is not None:
-                        leg["current_value"] = current
-                        status = event["status"]["type"]["description"].lower()
-                        if status == "final":
-                            if leg.get("side") == "over" and current > float(leg.get("line", 0)):
-                                leg["result"] = "won"
-                            elif leg.get("side") == "under" and current < float(leg.get("line", 0)):
-                                leg["result"] = "won"
-                            else:
-                                leg["result"] = "lost"
-                # Settle if all legs final
-                if all(l.get("result") in ("won", "lost") for l in bet["legs"]):
-                    all_won = all(l["result"] == "won" for l in bet["legs"])
-                    end_title = ("✅ Parlay WON" if all_won else "❌ Parlay LOST") if bet["bet_type"] == "parlay" else ("✅ Bet WON" if all_won else "❌ Bet LOST")
-                    final_embed = discord.Embed(title=end_title, color=discord.Color.green() if all_won else discord.Color.red())
-                    final_embed.add_field(name="League", value=bet["league"] or "Mixed", inline=True)
-                    if bet.get("odds") is not None:
-                        final_embed.add_field(name="Odds", value=str(bet["odds"]), inline=True)
-                    if bet.get("stake") is not None:
-                        final_embed.add_field(name="Stake", value=f"${bet['stake']}", inline=True)
-                    if bet.get("payout") is not None:
-                        final_embed.add_field(name="Payout", value=f"${bet['payout']}", inline=True)
-                    lines = []
-                    for idx, leg in enumerate(bet["legs"], start=1):
-                        res_icon = "✅" if leg.get("result") == "won" else "❌"
-                        if leg["type"] == "prop":
-                            detail = []
-                            if leg.get("side"): detail.append(leg["side"].upper())
-                            if leg.get("line") is not None: detail.append(str(leg["line"]))
-                            tgt = " ".join(detail) if detail else (leg.get("target_text") or "")
-                            curr_val = f" ({leg.get('current_value')})" if leg.get("current_value") is not None else ""
-                            lines.append(f"{idx}. {leg.get('player')} — {str(leg.get('stat')).title()} {tgt}{curr_val} {res_icon}".strip())
-                        elif leg["type"] == "total":
-                            lines.append(f"{idx}. Total — {leg.get('side','').upper()} {leg.get('line')} {res_icon}")
-                        elif leg["type"] == "spread":
-                            lines.append(f"{idx}. Spread — {leg.get('team')} {leg.get('line')} {res_icon}")
-                        elif leg["type"] == "moneyline":
-                            lines.append(f"{idx}. Moneyline — {leg.get('team') or 'Unknown'} {res_icon}")
-                        else:
-                            lines.append(f"{idx}. {leg.get('target_text') or 'Unknown leg'} {res_icon}")
-                    final_embed.add_field(name="Legs", value="\n".join(lines) if lines else "—", inline=False)
-                    final_embed.set_footer(text="Settled")
-                    await bet["message"].edit(embed=final_embed)
-                    self.tracked.pop(msg_id, None)
-                    save_tracked(self.tracked)
-            except Exception as e:
-                print(f"[ERROR] update_props failed for msg_id={msg_id}: {e}")
+    @tasks.loop(seconds=60.0)
+    async def settlement_loop(self):
+        try:
+            for bet_id, bet in self.tracked.items():
+                all_final = True
+                for leg in bet["legs"]:
+                    live = leg.get("live", "")
+                    if not (isinstance(live, str) and "Final" in live):
+                        all_final = False
+                        break
+                if all_final and bet.get("settlement") is None:
+                    bet["settled_at"] = datetime.utcnow().isoformat()
+                    bet["settlement"] = "unknown"
+                    await mark_settlement(bet_id, "unknown")
+            save_tracked_bets(self.tracked)
+        except Exception as e:
+            logger.exception(f"Settlement loop error: {e}")
 
-    @update_scores.before_loop
-    @update_props.before_loop
-    async def before_loops(self):
+    @scores_update_loop.before_loop
+    async def before_scores_loop(self):
         await self.bot.wait_until_ready()
 
-async def setup(bot: commands.Bot):
-    await bot.add_cog(Bets(bot))
+    @props_update_loop.before_loop
+    async def before_props_loop(self):
+        await self.bot.wait_until_ready()
+
+    @settlement_loop.before_loop
+    async def before_settlement_loop(self):
+        await self.bot.wait_until_ready()
