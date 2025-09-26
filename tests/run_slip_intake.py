@@ -1,57 +1,51 @@
-# tests/run_slip_intake.py
-import os, json, glob, logging
-from ocr_advanced import ocr_image_multi
-from format_router import detect_format
+"""
+Test harness for slip intake.
+Usage:
+    python tests/run_slip_intake.py <image_path>
 
-logging.basicConfig(level=logging.INFO)
+This will:
+- Load the image
+- Run advanced OCR (YOLO/EasyOCR/Tesseract depending on config)
+- Route text through format_router
+- Parse into a ParsedSlip object
+- Print structured output for diagnostics
+"""
 
-SLIPS_DIR = os.getenv("SLIPS_DIR", "tests/slips")
-MANIFEST = [
-    {"file": "HRLSGPBoost2.png", "label": "Hard Rock – MLB/NFL parlay w/ boost"},
-    {"file": "HRDParlay.png", "label": "Hard Rock – NFL player SGP"},
-    {"file": "HRSingleCashes.png", "label": "Hard Rock – Finished tab (settled bets)"},
-    {"file": "HRLCrop.png", "label": "Hard Rock – Cowboys moneyline tile"},
-    {"file": "HRGCash.png", "label": "Hard Rock – Jaguars first drive prop"},
-    {"file": "HRLParlay.png", "label": "Hard Rock – multi moneyline listings"},
-    {"file": "HRLSGPBoost.png", "label": "Hard Rock – Jaguars parlay w/ props"},
-]
+import asyncio
+import sys
+from pathlib import Path
 
-def summarize(text: str, n=200):
-    return text[:n].replace("\n", "\\n")
+from config import Config
+from ocr_advanced import run_ocr
+from format_router import route_text
+from parsing import parse_slip_text
 
-def main():
-    results = []
-    for item in MANIFEST:
-        path = os.path.join(SLIPS_DIR, item["file"])
-        with open(path, "rb") as f:
-            data = f.read()
-        ocr = ocr_image_multi(data)
-        text = ocr["text"]
-        fmt = detect_format(text) if text else "unknown"
-        ok = bool(text and fmt != "unknown")
-        results.append({
-            "file": item["file"],
-            "label": item["label"],
-            "ok": ok,
-            "format": fmt,
-            "len": len(text),
-            "mode": ocr["mode"],
-            "config": ocr["config"],
-            "scoreboard": sorted(ocr["candidates"], key=lambda x: (-x[3], -x[4]))[:5],
-            "preview": summarize(text),
-        })
-        print(f"[{ 'OK' if ok else 'FAIL' }] {item['label']} -> fmt={fmt}, len={len(text)}, mode={ocr['mode']}, cfg={ocr['config']}")
-        if not ok:
-            print(f"  Preview: {summarize(text, 260)}")
 
-    # Simple pass/fail summary
-    passed = sum(1 for r in results if r["ok"])
-    print(f"\n== Summary: {passed}/{len(results)} recognized ==")
+async def main(image_path: str):
+    config = Config.from_env()
+    img_bytes = Path(image_path).read_bytes()
 
-    # Optional: dump detailed JSON for diffing
-    os.makedirs("tests/output", exist_ok=True)
-    with open("tests/output/ocr_results.json", "w") as fp:
-        json.dump(results, fp, indent=2)
+    # Run OCR
+    ocr_out = run_ocr(img_bytes, config)
+    print("=== OCR TEXT ===")
+    print(ocr_out["text"])
+
+    # Route and normalize
+    routed_text, style = route_text(ocr_out["text"], config)
+    print("\n=== ROUTED TEXT (style: {}) ===".format(style))
+    print(routed_text)
+
+    # Parse into structured slip
+    parsed = parse_slip_text(routed_text, config.ocr_confidence_threshold, style)
+
+    print("\n=== PARSED SLIP ===")
+    print(f"Stake: {parsed.stake}, Payout: {parsed.payout}, Style: {parsed.sportsbook_style}")
+    for i, leg in enumerate(parsed.legs, start=1):
+        print(f"Leg {i}: {leg.league} | {leg.leg_type} | {leg.teams_or_player} | {leg.market} | Odds: {leg.odds}")
+
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print("Usage: python tests/run_slip_intake.py <image_path>")
+        sys.exit(1)
+    asyncio.run(main(sys.argv[1]))
