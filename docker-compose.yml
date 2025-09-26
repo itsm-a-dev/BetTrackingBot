@@ -1,27 +1,23 @@
-version: "3.8"
+version: "3.9"
+
 services:
-  db:
-    image: postgres:16
-    environment:
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_USER: postgres
-      POSTGRES_DB: bets
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-
-  bot:
+  bettrackingbot:
     build: .
-    depends_on:
-      - db
-    environment:
-      DISCORD_TOKEN: ${DISCORD_TOKEN}
-      POSTGRES_DSN: postgresql+asyncpg://postgres:postgres@db:5432/bets
-      TRACK_CHANNEL_ID: ${TRACK_CHANNEL_ID}
-      CONFIDENCE_THRESHOLD: 0.9
-      TESSERACT_CMD: /usr/bin/tesseract
+    container_name: bettrackingbot
     restart: unless-stopped
-
-volumes:
-  pgdata:
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CHANNEL_ID=${CHANNEL_ID}
+      - DEBUG_LOGGING=true
+      - USE_YOLO=false
+      - USE_EASYOCR=false
+    volumes:
+      - ./tracked_bets.json:/app/tracked_bets.json
+      - ./bets.db:/app/bets.db
+      - ./data/training:/app/data/training
+      - ./data/models:/app/data/models
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
